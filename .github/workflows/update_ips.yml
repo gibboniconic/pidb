@@ -1,0 +1,36 @@
+name: Update IP Lists
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # 每6小时运行一次
+
+jobs:
+  update-ips:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x' # 使用最新的Python 3版本
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # 如果脚本有依赖，这里需要添加安装命令，目前假设没有特定依赖
+
+      - name: Run get_cloudflare_ips.py
+        run: python scripts/get_cloudflare_ips.py
+
+      - name: Run get_proxy_ips.py
+        run: python scripts/get_proxy_ips.py
+
+      - name: Commit changes
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add cfipv4.txt cfipv6.txt proxyIP.txt
+          git commit -m "Update IP lists" || echo "No changes to commit"
+          git push
