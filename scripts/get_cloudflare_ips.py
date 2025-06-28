@@ -4,6 +4,7 @@ import subprocess
 import concurrent.futures
 import time
 import platform
+import re # Import regex module
 
 # Cloudflare IP ranges URLs
 IPV4_URL = "https://www.cloudflare.com/ips-v4"
@@ -26,43 +27,35 @@ def test_ip_latency(ip_address, count=4):
         param = '-n' if platform.system().lower() == 'windows' else '-c'
         command = ["ping", param, str(count), ip_address]
         
-        start_time = time.time()
-        process = subprocess.run(command, capture_output=True, text=True, timeout=10)
-        end_time = time.time()
-
-        if process.returncode == 0:
-            # Parse ping output for latency
-            output = process.stdout
-            # Example output: "time=12.345ms" or "avg = 12.345ms"
-            # Common patterns for latency in ping output
-            # Linux/macOS: "time=X.XXX ms" or "min/avg/max/mdev = X.XXX/Y.YYY/Z.ZZZ/A.AAA ms"
-            # Windows: "Time=Xms"
-            
-            # Try to find "time=" pattern (common for individual pings)
-            time_matches = [float(line.split("time=")[1].split(" ")[0].replace("ms", ""))
-                            for line in output.splitlines() if "time=" in line]
-            if time_matches:
-                return sum(time_matches) / len(time_matches)
-            
-            # Try to find "min/avg/max/" pattern (common for summary on Linux/macOS)
-            for line in output.splitlines():
-                if "min/avg/max/" in line:
-                    try:
-                        parts = line.split('=')[1].split('/')
-                        return float(parts[1]) # avg latency
-                    except (IndexError, ValueError):
-                        continue
-            
-            # Try to find "Average =" pattern (common for summary on Windows)
-            for line in output.splitlines():
-                if "Average =" in line and "ms" in line:
-                    try:
-                        latency_str = line.split("Average =")[1].split("ms")[0].strip()
-                        return float(latency_str)
-                    except (IndexError, ValueError):
-                        continue
+        # Add a shorter timeout for ping command itself to avoid long waits for unreachable hosts
+        # The subprocess.run timeout is for the entire command execution.
+        # For ping, we might want a per-ping timeout if supported, but -c handles total packets.
+        process = subprocess.run(command, capture_output=True, text=True, timeout=15) # Increased timeout slightly
         
-        return float('inf')  # Return infinity for unreachable or unparseable IPs
+        if process.returncode == 0:
+            output = process.stdout
+            # Regex to find latency values (e.g., time=X.XXX ms, Time=Xms, avg = X.XXXms)
+            # This regex tries to capture various formats for individual ping times or summary averages.
+            latency_matches = re.findall(r"time[=<](\d+\.?\d*)\s?ms|Average\s?=\s?(\d+\.?\d*)\s?ms|min/avg/max/mdev\s?=\s?\d+\.?\d*/(\d+\.?\d*)", output, re.IGNORECASE)
+            
+            latencies = []
+            for match in latency_matches:
+                # Group 1 for 'time=X.XXX ms', Group 2 for 'Average = X.XXX ms', Group 3 for 'min/avg/max/mdev = .../X.XXX/...'
+                if match[0]:
+                    latencies.append(float(match[0]))
+                elif match[1]:
+                    latencies.append(float(match[1]))
+                elif match[2]:
+                    latencies.append(float(match[2]))
+
+            if latencies:
+                return sum(latencies) / len(latencies)
+            else:
+                print(f"Warning: Could not parse latency from ping output for {ip_address}. Output:\n{output}")
+                return float('inf') # Could not parse latency
+        else:
+            print(f"Ping command failed for {ip_address} with return code {process.returncode}. Stderr: {process.stderr}")
+            return float('inf')  # Ping failed
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"Error testing IP {ip_address}: {e}")
         return float('inf') # Return infinity for errors
@@ -120,13 +113,17 @@ def main():
     for ip_range in ipv6_ranges:
         try:
             network = ipaddress.ip_network(ip_range, strict=False)
-            # For IPv6, network.hosts() might be empty or yield unpingable addresses.
-            # Try to get the first usable host address by adding 1 to the network address.
-            # This is a common heuristic for IPv6.
+            # For IPv6, try network_address + 1 first, then fallback to next(network.hosts())
+            # This is a common heuristic for IPv6 to get a pingable address.
             try:
-                ipv6_addresses.append(str(network.network_address + 1))
-            except TypeError: # Handle cases where network_address + 1 is not directly supported
-                # Fallback to next(network.hosts()) if adding 1 fails
+                # Attempt to get a common pingable address (e.g., gateway or first host)
+                # For IPv6, network_address + 1 is often a good candidate.
+                # Or, if the range is small, just use the network address itself if it's a host.
+                if network.num_addresses > 1: # Ensure there's at least one host
+                    ipv6_addresses.append(str(network.network_address + 1))
+                else: # If it's a /128, just use the address itself
+                    ipv6_addresses.append(str(network.network_address))
+            except TypeError: # Handle cases where network_address + 1 is not directly supported or meaningful
                 try:
                     ipv6_addresses.append(str(next(network.hosts())))
                 except StopIteration:
